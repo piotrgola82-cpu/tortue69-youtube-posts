@@ -1,0 +1,152 @@
+name: YouTube Community Posts
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "2-59/5 * * * *"
+permissions:
+  contents: write
+concurrency:
+  group: youtube-community-posts
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Install public-post parser
+        run: python3 -m pip install --disable-pip-version-check avtdl==2.11.6
+      - name: Check public posts and deliver without mentions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        shell: python
+        run: |
+          """One bounded cloud check. Public posts only; no Discord mentions."""
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+          
+          CHANNEL = 'UCBNZT6JppVbiJCopchM8Rmg'
+          DESTINATION = '1546486413631950879'
+          REPOSITORY = 'piotrgola82-cpu/tortue69-youtube-posts'
+          
+          
+          def request(url, body=None, headers=None):
+              req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(),
+                                           headers={'User-Agent': 'Tortue69Posts/1.0',
+                                                    'Content-Type': 'application/json', **(headers or {})})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+          
+          
+          def fetch_posts():
+              from avtdl.plugins.youtube.common import get_initial_data
+              from avtdl.plugins.youtube.community_info import CommunityPostInfo, get_posts_renderers, get_renderers
+              req = urllib.request.Request('https://www.youtube.com/@Tortue69apex/posts',
+                                           headers={'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'en-US,en;q=0.9'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  if 'youtube.com/' not in response.url:
+                      raise RuntimeError('YouTube did not return the public channel page')
+                  page = get_initial_data(response.read(8000000).decode())
+              posts = [CommunityPostInfo.from_post_renderer(item).model_dump()
+                       for item in get_posts_renderers(get_renderers(page))]
+              posts = [p for p in posts if p['channel_id'] == CHANNEL and not p['sponsor_only']]
+              if not posts:
+                  raise RuntimeError('No public posts parsed; refusing to change baseline')
+              if len({p['post_id'] for p in posts}) != len(posts):
+                  posts = list({p['post_id']: p for p in posts}.values())
+              return posts
+          
+          
+          class State:
+              def __init__(self):
+                  if os.environ['GITHUB_REPOSITORY'] != REPOSITORY:
+                      raise RuntimeError('Unexpected repository')
+                  self.url = f'https://api.github.com/repos/{REPOSITORY}/contents/state.json'
+                  self.headers = {'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'],
+                                  'Accept': 'application/vnd.github+json'}
+                  self.sha = None
+                  try:
+                      data = request(self.url, headers=self.headers)
+                  except urllib.error.HTTPError as error:
+                      if error.code != 404:
+                          raise
+                      self.data = {'seen': [], 'uncertain': []}
+                      return
+                  self.sha = data['sha']
+                  self.data = json.loads(base64.b64decode(data['content']))
+                  if not all(isinstance(self.data.get(k), list) for k in ['seen', 'uncertain']):
+                      raise RuntimeError('Invalid state; refusing to resend')
+          
+              def save(self):
+                  body = {'message': 'Update public post delivery state',
+                          'content': base64.b64encode(json.dumps(self.data, indent=2).encode()).decode(),
+                          'branch': 'main'}
+                  if self.sha:
+                      body['sha'] = self.sha
+                  req = urllib.request.Request(self.url, data=json.dumps(body).encode(), method='PUT',
+                                               headers={**self.headers, 'Content-Type': 'application/json',
+                                                        'User-Agent': 'Tortue69Posts/1.0'})
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      self.sha = json.load(response)['content']['sha']
+          
+          
+          def payload(post):
+              if post.get('channel_id') != CHANNEL or post.get('sponsor_only', False):
+                  raise ValueError('Only public Tortue69 posts are permitted')
+              post_id = post['post_id']
+              if not re.fullmatch(r'[A-Za-z0-9_-]{10,100}', post_id):
+                  raise ValueError('Invalid post identifier')
+              link = f'https://www.youtube.com/post/{post_id}'
+              return {'username': 'Tortue69 — YouTube Posts',
+                      'content': '**New YouTube post from Tortue69**\n' + link,
+                      'allowed_mentions': {'parse': [], 'users': [], 'roles': [], 'replied_user': False},
+                      'embeds': [{'title': 'Read the post on YouTube', 'url': link,
+                                  'description': post['full_text'][:3900] or 'Open the post on YouTube.'}]}
+          
+          
+          def process(posts, state, webhook, send=request):
+              if state.sha is None:
+                  state.data['seen'] = [p['post_id'] for p in posts]
+                  state.save()
+                  print(f'Initialized baseline: {len(posts)} existing posts; no backlog sent.')
+                  return
+              if state.data['uncertain']:
+                  raise RuntimeError('Uncertain previous delivery; inspect Discord before resolving state')
+              if not re.fullmatch(r'https://discord\.com/api/webhooks/\d+/[A-Za-z0-9_-]+', webhook):
+                  raise RuntimeError('Discord webhook secret is missing or invalid')
+              if send(webhook).get('channel_id') != DESTINATION:
+                  raise RuntimeError('Webhook belongs to a different channel')
+              new = [p for p in reversed(posts) if p['post_id'] not in state.data['seen']]
+              for post in new:
+                  message = payload(post)
+                  state.data['uncertain'].append(post['post_id'])
+                  state.save()  # Remote durable checkpoint BEFORE sending, not an ephemeral runner file.
+                  result = send(webhook + '?wait=true', message)
+                  if result.get('channel_id') != DESTINATION or not result.get('id'):
+                      raise RuntimeError('Discord acknowledgement did not match destination')
+                  state.data['uncertain'].remove(post['post_id'])
+                  state.data['seen'].append(post['post_id'])
+                  state.save()
+              print(f'Public posts read: {len(posts)}; delivered: {len(new)}; mentions disabled.')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  posts = fetch_posts()
+                  if '--probe' in sys.argv:
+                      print('Public post count:', len(posts))
+                      print('Latest public post:', posts[0]['post_id'])
+                  else:
+                      process(posts, State(), os.environ.get('DISCORD_WEBHOOK', ''))
+              except Exception as error:
+                  # Do not print exception URLs: they could contain the webhook credential.
+                  print('Check failed:', type(error).__name__, file=sys.stderr)
+                  if isinstance(error, (RuntimeError, ValueError)):
+                      print(str(error), file=sys.stderr)
+                  sys.exit(1)
+          

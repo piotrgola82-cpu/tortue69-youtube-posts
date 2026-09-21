@@ -43,6 +43,16 @@ jobs:
                   return json.load(response)
           
           
+          def parse_post(renderer):
+              from avtdl.plugins.youtube.community_info import CommunityPostInfo
+              # YouTube omits likes on some public posts; this metadata is not delivered.
+              # Preserve the post and strict validation of its identity and content.
+              votes = renderer.get('voteCount')
+              if votes is None or (isinstance(votes, dict) and votes.get('simpleText') is None):
+                  renderer = {**renderer, 'voteCount': {'simpleText': ''}}
+              return CommunityPostInfo.from_post_renderer(renderer).model_dump()
+          
+          
           def fetch_posts():
               from avtdl.plugins.youtube.common import get_initial_data
               from avtdl.plugins.youtube.community_info import CommunityPostInfo, get_posts_renderers, get_renderers
@@ -52,7 +62,7 @@ jobs:
                   if 'youtube.com/' not in response.url:
                       raise RuntimeError('YouTube did not return the public channel page')
                   page = get_initial_data(response.read(8000000).decode())
-              posts = [CommunityPostInfo.from_post_renderer(item).model_dump()
+              posts = [parse_post(item)
                        for item in get_posts_renderers(get_renderers(page))]
               posts = [p for p in posts if p['channel_id'] == CHANNEL and not p['sponsor_only']]
               if not posts:
